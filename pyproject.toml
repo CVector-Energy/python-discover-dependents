@@ -1,0 +1,16 @@
+[project]
+name = "python-discover-dependents-tests"
+version = "0"
+description = "Test harness for the script backing the python-discover-dependents action."
+requires-python = ">=3.11"
+classifiers = ["Private :: Do Not Upload"]
+
+[dependency-groups]
+dev = ["pytest>=9,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# Nothing here is packaged; the action ships the script as a file.
+[tool.uv]
+package = false

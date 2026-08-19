@@ -1,0 +1,191 @@
+name: Discover Python dependents
+description: Find every repository in an org that depends on a Python package, and resolve the version to roll out to them.
+
+# The first half of the publisher-side fan-out. Pair it with
+# CVector-Energy/python-bump-dependents, which takes one repository from the `repositories`
+# output and raises the upgrade PR:
+#
+#   jobs:
+#     discover:
+#       outputs:
+#         version: ${{ steps.d.outputs.version }}
+#         repositories: ${{ steps.d.outputs.repositories }}
+#         has-dependents: ${{ steps.d.outputs.has-dependents }}
+#       steps:
+#         - uses: CVector-Energy/python-discover-dependents@v1
+#           id: d
+#     bump:
+#       needs: discover
+#       if: needs.discover.outputs.has-dependents == 'true'
+#       strategy:
+#         fail-fast: false
+#         matrix:
+#           repository: ${{ fromJSON(needs.discover.outputs.repositories) }}
+#       steps:
+#         - uses: CVector-Energy/python-bump-dependents@v1
+
+inputs:
+  package:
+    description: The package name as it appears in dependents' pyproject.toml.
+    required: true
+  app-id:
+    description: >-
+      Client ID of a GitHub App installed org-wide. Code search spans the org, and naming the
+      dependent repositories in the workflow is the hard-coded list this action exists to
+      avoid, so discovery needs an unscoped read. The write-capable tokens are minted per
+      consumer by the bump action, scoped to one repository each.
+    required: true
+  app-private-key:
+    description: Private key of that GitHub App.
+    required: true
+  owner:
+    description: Org to search. Defaults to the calling repository's owner.
+    required: false
+    default: ${{ github.repository_owner }}
+  self:
+    description: Repository name to exclude from the results — the publisher's own. Defaults to the calling repository.
+    required: false
+    default: ${{ github.event.repository.name }}
+  version:
+    description: Version to roll out. Defaults to the tag of the release that triggered the workflow, with any leading `v` stripped.
+    required: false
+    default: ""
+  repositories:
+    description: Space-separated repository names to bump instead of the discovered set (an owner/ prefix is stripped). For re-running a single consumer.
+    required: false
+    default: ""
+  allow-empty:
+    description: >-
+      Treat "no dependents found" as a clean no-op rather than an error. Default false,
+      because a search that silently returns nothing — a token that lost its scope, an index
+      that has not caught up — otherwise looks exactly like a run that bumped everything.
+      Set true for a package that is published before anything consumes it.
+    required: false
+    default: "false"
+  wait-command:
+    description: >-
+      Optional shell snippet polled until it exits zero, to hold until the new version is
+      actually installable. Runs with PACKAGE and VERSION in the environment. Publishing
+      usually runs off the same release event, so discovery can start before the artifact is
+      on the index; waiting on the artifact rather than on the other workflow keeps a manual
+      re-run correct too.
+    required: false
+    default: ""
+  wait-attempts:
+    description: How many times to run wait-command before giving up.
+    required: false
+    default: "30"
+  wait-interval:
+    description: Seconds between wait-command attempts.
+    required: false
+    default: "20"
+
+outputs:
+  version:
+    description: The resolved version, without a leading `v`.
+    value: ${{ steps.version.outputs.version }}
+  repositories:
+    description: JSON array of bare repository names, ready for `fromJSON` in a matrix.
+    value: ${{ steps.discover.outputs.repositories }}
+  count:
+    description: How many dependents were found.
+    value: ${{ steps.discover.outputs.count }}
+  has-dependents:
+    description: '"true" when at least one dependent was found. Gate the bump job on this so an empty matrix does not fail the run.'
+    value: ${{ steps.discover.outputs.has-dependents }}
+  token:
+    description: The org-read GitHub App token, for callers that need to keep searching.
+    value: ${{ steps.app.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create GitHub App token
+      id: app
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0 # zizmor: ignore[github-app] org-wide read is required for discovery; see the app-id input
+      with:
+        client-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ inputs.owner }}
+        # Code search reads file contents, so metadata scope alone is not enough for it.
+        permission-contents: read
+
+    - name: Resolve version
+      id: version
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+      run: |
+        set -euo pipefail
+        RAW="${INPUT_VERSION:-${RELEASE_TAG:-}}"
+        if [ -z "$RAW" ]; then
+          echo "::error::No version supplied and no release tag on the event."
+          exit 1
+        fi
+        # Publishers derive the wheel version from the tag by stripping `v`, so strip the same prefix here.
+        VERSION="${RAW#v}"
+        # The version becomes replacement text inside a TOML string, so a tag that is not version-shaped would write a broken pyproject.toml to every consumer. Permissive enough for PEP 440 local/dev builds (`0.7.2.dev1+g2f463d36e`), strict enough to exclude quotes and shell metacharacters.
+        if ! printf '%s' "$VERSION" | grep -Eq '^[0-9][A-Za-z0-9.+-]*$'; then
+          echo "::error::Refusing to roll out '${VERSION}': not a version string."
+          exit 1
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Wait for the version to be installable
+      if: inputs.wait-command != ''
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        VERSION: ${{ steps.version.outputs.version }}
+        WAIT_COMMAND: ${{ inputs.wait-command }}
+        ATTEMPTS: ${{ inputs.wait-attempts }}
+        INTERVAL: ${{ inputs.wait-interval }}
+      run: |
+        set -euo pipefail
+        for _ in $(seq 1 "$ATTEMPTS"); do
+          if bash -c "$WAIT_COMMAND"; then
+            echo "$PACKAGE $VERSION is available."
+            exit 0
+          fi
+          sleep "$INTERVAL"
+        done
+        echo "::error::$PACKAGE $VERSION never became available; did the publish workflow fail?"
+        exit 1
+
+    - name: Discover dependents
+      id: discover
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+        OWNER: ${{ inputs.owner }}
+        PACKAGE: ${{ inputs.package }}
+        SELF: ${{ inputs.self }}
+        OVERRIDE: ${{ inputs.repositories }}
+        ALLOW_EMPTY: ${{ inputs.allow-empty }}
+      run: |
+        set -euo pipefail
+        REPOS=$("${GITHUB_ACTION_PATH}/scripts/discover.sh" "$OWNER" "$PACKAGE" "$SELF" "$OVERRIDE")
+        COUNT=$(jq 'length' <<<"$REPOS")
+        echo "repositories=${REPOS}" >> "$GITHUB_OUTPUT"
+        echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+        if [ "$COUNT" -eq 0 ]; then
+          echo "has-dependents=false" >> "$GITHUB_OUTPUT"
+          if [ "$ALLOW_EMPTY" != "true" ]; then
+            echo "::error::Found no dependents of ${PACKAGE}. Check that the app is installed org-wide, or pass the repositories input. Set allow-empty if this package genuinely has no consumers yet."
+            exit 1
+          fi
+          echo "::notice::No dependents of ${PACKAGE} found; nothing to bump."
+          echo "### No dependents of \`${PACKAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        echo "has-dependents=true" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Dependents discovered"
+          echo
+          jq -r --arg owner "$OWNER" '.[] | "- \($owner)/\(.)"' <<<"$REPOS"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+branding:
+  icon: git-pull-request
+  color: orange
